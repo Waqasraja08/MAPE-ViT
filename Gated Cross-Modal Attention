@@ -1,0 +1,356 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+class AttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super(AttentionBlock, self).__init__()
+        self.channels = channels
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // 8, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(channels // 8, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        attention = self.fc(x)
+        return x * attention
+
+class ImprovedFuseNet(nn.Module):
+    def __init__(self):
+        super(ImprovedFuseNet, self).__init__()
+
+        # RGB stream
+        self.rgb_conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.rgb_conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        # Depth stream
+        self.depth_conv1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+        self.depth_conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        # Attention blocks
+        self.rgb_attention = AttentionBlock(64)
+        self.depth_attention = AttentionBlock(64)
+
+        # Fusion layers
+        self.fuse_conv1 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
+        self.fuse_conv2 = nn.Conv2d(64, 3, kernel_size=3, padding=1)
+
+    def forward(self, rgb, depth):
+        # RGB stream
+        rgb = F.relu(self.rgb_conv1(rgb))
+        rgb = F.relu(self.rgb_conv2(rgb))
+
+        # Depth stream
+        depth = F.relu(self.depth_conv1(depth))
+        depth = F.relu(self.depth_conv2(depth))
+
+        # Apply attention
+        rgb = self.rgb_attention(rgb)
+        depth = self.depth_attention(depth)
+
+        # Fusion
+        fused = torch.cat((rgb, depth), dim=1)
+        fused = F.relu(self.fuse_conv1(fused))
+        fused = self.fuse_conv2(fused)
+
+        return fused
+
+def load_and_preprocess(rgb_path, depth_path):
+    # Load RGB image and get original size
+    rgb_img = Image.open(rgb_path).convert('RGB')
+    original_size = rgb_img.size  # (width, height)
+
+    # Preprocessing: convert to tensor
+    rgb_transform = transforms.Compose([
+        transforms.Resize((original_size[1], original_size[0])),  # Resize to original size
+        transforms.ToTensor(),
+    ])
+    rgb_tensor = rgb_transform(rgb_img).unsqueeze(0)
+
+    # Load depth image and resize to match the original size of the RGB image
+    depth_img = Image.open(depth_path)
+    depth_np = np.array(depth_img)
+
+    # Normalize depth image to 0-1 range
+    depth_np = depth_np.astype(np.float32) / np.max(depth_np)
+
+    depth_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((original_size[1], original_size[0])),  # Resize to match RGB
+        transforms.ToTensor(),
+    ])
+    depth_tensor = depth_transform(depth_np).unsqueeze(0)
+
+    return rgb_tensor, depth_tensor, original_size
+
+def visualize_results(rgb, depth, fused, original_size):
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+
+    ax1.imshow(rgb.squeeze().permute(1, 2, 0).numpy())
+    ax1.set_title('RGB Image')
+    ax1.axis('off')
+
+    depth_display = depth.squeeze().numpy()
+    ax2.imshow(depth_display, cmap='viridis')
+    ax2.set_title('Depth Image')
+    ax2.axis('off')
+
+    # Normalize fused output for visualization
+    fused_np = fused.squeeze().permute(1, 2, 0).detach().numpy()
+    fused_np = (fused_np - fused_np.min()) / (fused_np.max() - fused_np.min())
+    fused_np_resized = np.array(Image.fromarray((fused_np * 255).astype(np.uint8)).resize(original_size))
+    ax3.imshow(fused_np_resized)
+    ax3.set_title('Fused Image')
+    ax3.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+def save_fused_image(fused, output_path, original_size):
+    # Convert fused tensor to PIL image
+    fused_np = fused.squeeze().permute(1, 2, 0).detach().numpy()
+    fused_np = (fused_np - fused_np.min()) / (fused_np.max() - fused_np.min())  # Normalize for saving
+    fused_img_resized = Image.fromarray((fused_np * 255).astype(np.uint8)).resize(original_size)
+
+    # Save the image
+    fused_img_resized.save(output_path)
+    print(f"Fused image saved at: {output_path}")
+
+# Main execution
+if __name__ == "__main__":
+
+
+    # Specify the paths to your RGB and depth image folders
+    rgb_dir = "/content/drive/MyDrive/Paper6/RA/Processed"
+    depth_dir = "/content/drive/MyDrive/Paper6/RA/Processed/D"
+    output_dir = "/content/drive/MyDrive/Paper6/RA/Processed/Fused"
+
+    # Create the output directory if it doesn't exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Initialize FuseNet model
+    fusenet = ImprovedFuseNet()
+    fusenet.eval()  # Set to evaluation mode
+
+    # Process each RGB image in the folder
+    for rgb_filename in os.listdir(rgb_dir):
+        if rgb_filename.endswith('.jpg') or rgb_filename.endswith('.png'):
+            rgb_path = os.path.join(rgb_dir, rgb_filename)
+
+            # Modify depth image filename to match the corresponding RGB image
+            depth_filename = "depth_" + rgb_filename
+            depth_path = os.path.join(depth_dir, depth_filename)
+
+            if os.path.exists(depth_path):
+                # Load and preprocess the images
+                rgb_tensor, depth_tensor, original_size = load_and_preprocess(rgb_path, depth_path)
+
+                # Run FuseNet on the input images
+                with torch.no_grad():
+                    fused_output = fusenet(rgb_tensor, depth_tensor)
+
+                # Save the fused image to the output folder
+                output_path = os.path.join(output_dir, rgb_filename)
+                save_fused_image(fused_output, output_path, original_size)
+            else:
+                print(f"Depth image not found for {rgb_filename}")
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+# Channel Attention Module
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction_ratio, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction_ratio, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+# Gated Cross-Modal Attention Module
+class GatedCrossModalAttention(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channels)
+        self.query_conv = nn.Conv2d(channels, channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(channels, channels // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(channels, channels, kernel_size=1)
+        self.gate_conv = nn.Conv2d(channels + 1, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, rgb_features, depth_features):
+        batch_size, channels, height, width = rgb_features.size()
+
+        # Channel attention
+        rgb_features = self.channel_attention(rgb_features)
+        depth_features = self.channel_attention(depth_features)
+
+        # Calculate standard deviation of depth features across channels
+        depth_std = torch.std(depth_features, dim=1, keepdim=True)
+
+        query = self.query_conv(rgb_features).view(batch_size, -1, height * width).permute(0, 2, 1)
+        key = self.key_conv(depth_features).view(batch_size, -1, height * width)
+        value = self.value_conv(depth_features).view(batch_size, -1, height * width)
+
+        attention = self.softmax(torch.bmm(query, key) / (channels // 8)**0.5)
+
+        # Gating mechanism (input includes std dev)
+        gate_input = torch.cat([depth_features, depth_std], dim=1)
+        gate = self.sigmoid(self.gate_conv(gate_input))
+
+        # Apply the gate to the VALUE before the weighted sum
+        gated_value = value * gate.view(batch_size, 1, height * width)
+        out = torch.bmm(gated_value, attention.permute(0, 2, 1)).view(batch_size, -1, height, width)
+        return out
+
+# Improved FuseNet Model
+class ImprovedFuseNet(nn.Module):
+    def __init__(self):
+        super(ImprovedFuseNet, self).__init__()
+
+        # RGB stream
+        self.rgb_conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.rgb_conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        # Depth stream
+        self.depth_conv1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+        self.depth_conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        # Cross-modal attention
+        self.cross_modal_attention = GatedCrossModalAttention(64)
+
+        # Fusion layers
+        self.fuse_conv1 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.fuse_conv2 = nn.Conv2d(64, 3, kernel_size=3, padding=1)
+
+    def forward(self, rgb, depth):
+        # RGB stream
+        rgb = F.relu(self.rgb_conv1(rgb))
+        rgb = F.relu(self.rgb_conv2(rgb))
+
+        # Depth stream
+        depth = F.relu(self.depth_conv1(depth))
+        depth = F.relu(self.depth_conv2(depth))
+
+        # Cross-modal attention
+        fused = self.cross_modal_attention(rgb, depth)
+
+        # Fusion layers
+        fused = F.relu(self.fuse_conv1(fused))
+        fused = self.fuse_conv2(fused)
+
+        return fused
+
+# Image loading and preprocessing
+def load_and_preprocess(rgb_path, depth_path):
+    rgb_img = Image.open(rgb_path).convert('RGB')
+    depth_img = Image.open(depth_path)
+    depth_np = np.array(depth_img)
+    depth_np = depth_np.astype(np.float32) / np.max(depth_np)
+
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()
+    ])
+
+    rgb_tensor = transform(rgb_img).unsqueeze(0)
+    depth_tensor = transform(Image.fromarray(depth_np)).unsqueeze(0)
+
+    return rgb_tensor, depth_tensor
+
+# Visualization
+def visualize_results(rgb, depth, fused):
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+
+    ax1.imshow(rgb.squeeze().permute(1, 2, 0).cpu().numpy())
+    ax1.set_title('RGB Image')
+    ax1.axis('off')
+
+    ax2.imshow(depth.squeeze().cpu().numpy(), cmap='viridis')
+    ax2.set_title('Depth Image')
+    ax2.axis('off')
+
+    fused_np = fused.squeeze().permute(1, 2, 0).detach().cpu().numpy()
+    fused_np = (fused_np - fused_np.min()) / (fused_np.max() - fused_np.min())
+    ax3.imshow(fused_np)
+    ax3.set_title('Fused Image')
+    ax3.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# Save fused image
+def save_fused_image(fused, output_path):
+    fused_np = fused.squeeze().permute(1, 2, 0).detach().cpu().numpy()
+    fused_np = (fused_np - fused_np.min()) / (fused_np.max() - fused_np.min())
+    fused_img = Image.fromarray((fused_np * 255).astype(np.uint8))
+    fused_img.save(output_path)
+    print(f"Fused image saved at: {output_path}")
+
+# Main execution
+if __name__ == "__main__":
+    rgb_dir = "/content/drive/MyDrive/Paper6/RA/Processed"  # Replace with your RGB directory
+    depth_dir = "/content/drive/MyDrive/Paper6/RA/Processed/D" # Replace with your depth directory
+    output_dir = "/content/drive/MyDrive/Paper6/RA/Processed/Fused" # Replace with your output directory
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    fusenet = ImprovedFuseNet()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fusenet.to(device)
+    fusenet.eval()
+
+    for rgb_filename in os.listdir(rgb_dir):
+        if rgb_filename.endswith(('.jpg', '.png')):
+            rgb_path = os.path.join(rgb_dir, rgb_filename)
+            depth_filename = "depth_" + rgb_filename
+            depth_path = os.path.join(depth_dir, depth_filename)
+
+            if os.path.exists(depth_path):  # Check if the corresponding depth image exists
+                # Load and preprocess images
+                rgb_tensor, depth_tensor = load_and_preprocess(rgb_path, depth_path)
+
+                # Move tensors to the appropriate device
+                rgb_tensor = rgb_tensor.to(device)
+                depth_tensor = depth_tensor.to(device)
+
+                # Forward pass through the network
+                with torch.no_grad():
+                    fused_output = fusenet(rgb_tensor, depth_tensor)
+
+                # Save the fused image
+                fused_filename = "fused_" + rgb_filename
+                output_path = os.path.join(output_dir, fused_filename)
+                save_fused_image(fused_output, output_path)
+            else:
+                print(f"Depth image not found for {rgb_filename}. Skipping.")
+
