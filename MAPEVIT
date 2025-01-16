@@ -1,0 +1,189 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class ImprovedMSERModule(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        # Add learnable parameters for MSER detection
+        self.region_encoder = nn.Sequential(
+            nn.Conv2d(1, hidden_dim, 3, padding=1),
+            nn.LayerNorm([hidden_dim, None, None]),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1)
+        )
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # Convert to grayscale if needed
+        if C > 1:
+            gray = 0.299 * x[:,0] + 0.587 * x[:,1] + 0.114 * x[:,2]
+            gray = gray.unsqueeze(1)
+        else:
+            gray = x
+            
+        # Extract MSER features
+        region_features = self.region_encoder(gray)
+        return region_features
+
+class ImprovedWaveletModule(nn.Module):
+    def __init__(self, hidden_dim=256, levels=3):
+        super().__init__()
+        self.levels = levels
+        self.hidden_dim = hidden_dim
+        self.wavelet_encoder = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(2**i, hidden_dim, 3, padding=1),
+                nn.LayerNorm([hidden_dim, None, None]),
+                nn.GELU()
+            ) for i in range(levels)
+        ])
+        
+    def forward(self, x):
+        features = []
+        for i in range(self.levels):
+            # Simulate wavelet decomposition with learned filters
+            down = F.avg_pool2d(x, 2**i) if i > 0 else x
+            feat = self.wavelet_encoder[i](down)
+            # Upsample back to original size
+            if i > 0:
+                feat = F.interpolate(feat, size=(x.shape[2], x.shape[3]))
+            features.append(feat)
+        return torch.cat(features, dim=1)
+
+class AttentionFusion(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(hidden_dim, 8, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, mser_features, wavelet_features):
+        B, C, H, W = mser_features.shape
+        # Reshape to sequence
+        mser_seq = mser_features.flatten(2).transpose(1, 2)
+        wavelet_seq = wavelet_features.flatten(2).transpose(1, 2)
+        
+        # Cross-attention fusion
+        fused_features = self.attention(
+            self.norm(mser_seq),
+            self.norm(wavelet_seq),
+            self.norm(wavelet_seq)
+        )[0]
+        
+        return fused_features.transpose(1, 2).reshape(B, C, H, W)
+
+class StandardizedPatchExtractor(nn.Module):
+    def __init__(self, patch_size=16, stride=16):
+        super().__init__()
+        self.patch_size = patch_size
+        self.stride = stride
+        
+    def forward(self, x, fused_features):
+        B, C, H, W = x.shape
+        # Extract fixed-size patches
+        patches = F.unfold(
+            x, 
+            kernel_size=(self.patch_size, self.patch_size),
+            stride=(self.stride, self.stride)
+        )
+        
+        # Reshape to patch format
+        P = self.patch_size
+        L = patches.shape[-1]
+        patches = patches.transpose(1, 2).reshape(B, L, C, P, P)
+        
+        # Extract corresponding feature patches
+        feature_patches = F.unfold(
+            fused_features,
+            kernel_size=(self.patch_size, self.patch_size),
+            stride=(self.stride, self.stride)
+        )
+        feature_patches = feature_patches.transpose(1, 2).reshape(B, L, -1, P, P)
+        
+        # Concatenate image and feature patches
+        return torch.cat([patches, feature_patches], dim=2)
+
+class ImprovedPatchEmbedding(nn.Module):
+    def __init__(self, patch_size=16, in_channels=256, embed_dim=768):
+        super().__init__()
+        self.patch_size = patch_size
+        patch_dim = patch_size * patch_size * in_channels
+        
+        self.projection = nn.Sequential(
+            nn.Linear(patch_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+        
+        # Learnable position embeddings
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1000, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+    def forward(self, patches):
+        B, N, C, H, W = patches.shape
+        x = patches.flatten(2)  # Flatten patches to vectors
+        
+        # Project patches to embedding dimension
+        x = self.projection(x)
+        
+        # Add position embeddings
+        pos_embed = self.pos_embed[:, :N]
+        x = x + pos_embed
+        
+        # Add classification token
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        
+        return x
+
+class ImprovedMAPEViT(nn.Module):
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_channels=3,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4
+    ):
+        super().__init__()
+        self.mser = ImprovedMSERModule()
+        self.wavelet = ImprovedWaveletModule()
+        self.fusion = AttentionFusion()
+        self.patch_extractor = StandardizedPatchExtractor(patch_size)
+        self.embedding = ImprovedPatchEmbedding(patch_size, in_channels, embed_dim)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * mlp_ratio,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        
+        # Output projection
+        self.norm = nn.LayerNorm(embed_dim)
+        
+    def forward(self, x):
+        # 1. Extract MSER and Wavelet features
+        mser_features = self.mser(x)
+        wavelet_features = self.wavelet(x)
+        
+        # 2. Fuse features using attention
+        fused_features = self.fusion(mser_features, wavelet_features)
+        
+        # 3. Extract standardized patches
+        patches = self.patch_extractor(x, fused_features)
+        
+        # 4. Create patch embeddings
+        embeddings = self.embedding(patches)
+        
+        # 5. Process through transformer
+        features = self.transformer(embeddings)
+        features = self.norm(features)
+        
+        # Return [CLS] token features and patch features
+        return features[:, 0], features[:, 1:]
