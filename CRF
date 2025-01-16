@@ -1,0 +1,24 @@
+class CRFSceneClassifier(nn.Module):
+    def __init__(self, num_classes, input_dim):
+        super(CRFSceneClassifier, self).__init__()
+                self.num_classes = num_classes
+        self.pairwise_potentials = nn.Parameter(torch.randn(num_classes, num_classes))
+                self.unary_transform = nn.Linear(input_dim, num_classes)
+    def forward(self, elm_probs, vit_features, depth_grad_stats):
+               combined_features = torch.cat([elm_probs, vit_features, depth_grad_stats], dim=1)
+
+        unary_potentials = self.unary_transform(combined_features)
+        pairwise_term = self.compute_pairwise_potentials(unary_potentials)
+        scene_labels = self.crf_inference(unary_potentials, pairwise_term)
+        return scene_labels
+
+    def compute_pairwise_potentials(self, unary_potentials):
+        pairwise_term = torch.matmul(unary_potentials, self.pairwise_potentials)
+        return pairwise_term
+ def crf_inference(self, unary_potentials, pairwise_term):
+        return torch.argmax(unary_potentials + pairwise_term, dim=1)
+def classify_scene(elm_probs, vit_features, depth_grad_stats, num_classes):
+       input_dim = elm_probs.shape[1] + vit_features.shape[1] + depth_grad_stats.shape[1]
+    crf_classifier = CRFSceneClassifier(num_classes=num_classes, input_dim=input_dim)
+    scene_labels = crf_classifier(elm_probs, vit_features, depth_grad_stats)
+    return scene_labels
