@@ -1,0 +1,89 @@
+Input: 
+- Image I
+- Number of clusters K
+- Convergence threshold ε
+- Maximum iterations max_iter
+- Neighborhood system N (8-connected)
+- Graph cut smoothness parameter λ
+Output: Segmented image
+// Phase 1: Initialization
+Initialize_Parameters():
+    // K-means initialization for robustness
+    μk = kmeans_initialization(I, K)
+    Σk = compute_covariance_per_cluster()
+    wk = 1/K for all k
+    iteration = 0
+    diff = ∞
+// Phase 2: Fuzzy GMM Optimization
+while (diff > ε && iteration < max_iter):
+    // Store old parameters for convergence check
+    old_params = {μk, Σk, wk}
+      // Compute memberships
+    for each pixel i in I:
+        for each cluster k in K:
+            // Proper GMM probability calculation
+            numerator = wk * gaussian_pdf(I(i)|μk,Σk)
+            denominator = Σj=1:K (wj * gaussian_pdf(I(i)|μj,Σj))
+            U[i,k] = numerator/denominator
+    // Update parameters
+    for each cluster k in K:
+        // Update means
+        μk = Σi (U[i,k] * I(i)) / Σi U[i,k]
+        
+        // Update covariances with regularization
+        Σk = Σi (U[i,k] * (I(i) - μk)(I(i) - μk)T) / Σi U[i,k] + δI
+        
+        // Update weights
+        wk = Σi U[i,k] / N
+
+    // Check convergence
+    diff = compute_parameter_difference(old_params, {μk, Σk, wk})
+    iteration += 1
+
+// Phase 3: Graph Construction and Cut
+Construct_Graph():
+    G = initialize_graph(size(I))
+    
+    // Set data terms (unary potentials)
+    for each pixel i:
+        for each label k:
+            data_cost[i,k] = -log(U[i,k])
+    
+    // Set smoothness terms (pairwise potentials)
+    for each pixel i:
+        for each neighbor j in N(i):
+            intensity_diff = ||I(i) - I(j)||
+            spatial_weight = exp(-intensity_diff²/(2σ²))
+            edge_weight = λ * spatial_weight
+            add_edge(G, i, j, edge_weight)
+
+// Phase 4: Multi-level Optimization
+Optimize_Segmentation():
+    // Get initial GMM segmentation
+    seg_gmm = argmax_k(U[i,k]) for each pixel i
+    
+    // Perform graph cut
+    seg_gc = graph_cut_optimize(G, data_cost)
+    
+    // Confidence measure calculation
+    conf_gmm = compute_confidence(U, seg_gmm)
+    conf_gc = compute_spatial_coherence(seg_gc)
+    
+    // Adaptive weight calculation
+    w_gmm = conf_gmm / (conf_gmm + conf_gc)
+    w_gc = conf_gc / (conf_gmm + conf_gc)
+
+// Phase 5: Final Label Fusion
+Compute_Final_Labels():
+    for each pixel i:
+        prob_gmm = U[i, seg_gmm(i)]
+        prob_gc = U[i, seg_gc(i)]
+        
+        // Weighted probability fusion
+        final_prob = w_gmm * prob_gmm + w_gc * prob_gc
+        
+        // Final label assignment
+        seg_final(i) = argmax_k(final_prob)
+
+return seg_final
+
